@@ -1,2 +1,2 @@
 # Sonnet.GrayBox.Cosmos
-Common operations on Microsoft Azure Cosmos databases
+Common CRUD operations on Microsoft Azure Cosmos databases.
