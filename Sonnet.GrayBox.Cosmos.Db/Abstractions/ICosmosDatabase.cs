@@ -11,7 +11,7 @@ namespace Sonnet.GrayBox.Cosmos.Db.Abstractions
         string Name { get; set; }
         string EndpointUri { get; set; }
         string PrimaryKey { get; set; }
-        double RequestCharge { get; }
+        double TotalRequestCharge { get; }
 
         string DatabaseId { get; }
         string ContainerId { get; }

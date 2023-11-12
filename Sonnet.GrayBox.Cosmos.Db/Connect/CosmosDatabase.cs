@@ -1,4 +1,5 @@
-﻿using Microsoft.Azure.Cosmos;
+﻿using Azure;
+using Microsoft.Azure.Cosmos;
 using Microsoft.Extensions.Logging;
 using Newtonsoft.Json;
 using Sonnet.GrayBox.Cosmos.Db.Abstractions;
@@ -31,11 +32,11 @@ namespace Sonnet.GrayBox.Cosmos.Db.Connect
         /// <summary>
         /// Will contain total amount of RUs consumed for all request for lifetime of the object
         /// </summary>
-        public double RequestCharge { get; private set; }
+        public double TotalRequestCharge { get; private set; }
         /// <summary>
-        /// Will contain total amount of seconds for all request for lifetime of the object
+        /// Will contain total amount of milliseconds for all request for lifetime of the object
         /// </summary>
-        public double RequestTimeInSeconds { get; private set; }
+        public double TotalRequestTime { get; private set; }
 
         public CosmosDatabase()
         {
@@ -81,56 +82,49 @@ namespace Sonnet.GrayBox.Cosmos.Db.Connect
 
         public async Task CreateItemAsync(T item, string id, PartitionKey partitionKey)
         {
-            DateTime start = DateTime.Now;
+            ItemResponse<T> response = null;
 
             try
             {
                 CheckContainer();
-                ItemResponse<T> topicResponse = await this._container.ReadItemAsync<T>(id: id, partitionKey: partitionKey);
+                response = await this._container.ReadItemAsync<T>(id: id, partitionKey: partitionKey);
             }
             catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
             {
-                ItemResponse<T> itemResponse = await this._container.CreateItemAsync<T>(item: item, partitionKey: partitionKey);
-                //see the amount of RUs consumed on this request
-                this.RequestCharge += itemResponse.RequestCharge;
+                response = await this._container.CreateItemAsync<T>(item: item, partitionKey: partitionKey);
             }
             catch (CosmosException e)
             {
-                _logger?.LogError($"Status Code: { e.StatusCode } | Message: { e.Message }");
+                _logger?.LogError($"Status Code: {e.StatusCode} | Exception: {e.Message}");
                 throw e;
             }
             catch (Exception e)
             {
-                _logger?.LogError($"Exception: { e.Message }");
+                _logger?.LogError($"Exception: {e.Message }");
                 throw e;
             }
             finally
             {
-                this.RequestTimeInSeconds += (DateTime.Now - start).TotalSeconds;
+                SetDiagnostics(response);
             }
         } 
 
         public async Task<T> ReadItemAsync(string id, string partitionKey)
         {
-            DateTime start = DateTime.Now;
-            ItemResponse<T> response;
+            ItemResponse<T> response = null;
 
             try
             {
                 CheckContainer();
-
                 response = await _container.ReadItemAsync<T>(id: id, partitionKey: new PartitionKey(partitionKey));
-                //see the amount of RUs consumed on this request
-                this.RequestCharge += response.RequestCharge;
             }
             catch (CosmosException e) when (e.StatusCode == HttpStatusCode.NotFound)
             {
-                _logger?.LogError($"Status Code: { e.StatusCode } | Message: { e.Message }");
-                response = null;
+                _logger?.LogError($"Status Code: { e.StatusCode } | Exception: { e.Message }");
             }
             catch (CosmosException e)
             {
-                _logger?.LogError($"Status Code: { e.StatusCode } | Message: { e.Message }");
+                _logger?.LogError($"Status Code: { e.StatusCode } | Exception: { e.Message }");
                 throw e;
             }
             catch (Exception e)
@@ -140,7 +134,7 @@ namespace Sonnet.GrayBox.Cosmos.Db.Connect
             }
             finally
             {
-                this.RequestTimeInSeconds += (DateTime.Now - start).TotalSeconds;
+                SetDiagnostics(response);
             }
 
             return response ?? Task.FromResult<T>(default).Result;
@@ -148,15 +142,15 @@ namespace Sonnet.GrayBox.Cosmos.Db.Connect
 
         public async Task<List<dynamic>> QueryItemDynamicStreamAsync(string query)
         {
-            List<dynamic> result = new List<dynamic>();
-            DateTime start = DateTime.Now;
+            List<dynamic> result = new();
+            double totalElapsedTime = 0;
 
             try
             {
                 CheckContainer();
 
-                QueryDefinition queryDefinition = new QueryDefinition(query);
-                JsonSerializer jsonSerializer = new JsonSerializer();
+                QueryDefinition queryDefinition = new(query);
+                JsonSerializer jsonSerializer = new();
 
                 using FeedIterator iterator = this._container.GetItemQueryStreamIterator(queryDefinition);
                 while (iterator.HasMoreResults)
@@ -165,10 +159,11 @@ namespace Sonnet.GrayBox.Cosmos.Db.Connect
                     response.EnsureSuccessStatusCode();
 
                     //see the amount of RUs consumed on this request
-                    this.RequestCharge += response.Headers.RequestCharge;
+                    TotalRequestCharge += response.Headers.RequestCharge;
+                    totalElapsedTime = response.Diagnostics.GetClientElapsedTime().TotalMilliseconds;
 
-                    using StreamReader sr = new StreamReader(response.Content);
-                    using JsonTextReader jtr = new JsonTextReader(sr);
+                    using StreamReader sr = new(response.Content);
+                    using JsonTextReader jtr = new(sr);
                     dynamic jAr = jsonSerializer.Deserialize<dynamic>(jtr).Documents;
 
                     for (int i = 0, max = jAr.Count; i < max; i++)
@@ -177,7 +172,7 @@ namespace Sonnet.GrayBox.Cosmos.Db.Connect
             }
             catch (CosmosException e)
             {
-                _logger?.LogError($"Status Code: { e.StatusCode } | Message: { e.Message }");
+                _logger?.LogError($"Status Code: { e.StatusCode } | Exception: { e.Message }");
                 throw e;
             }
             catch (Exception e)
@@ -187,7 +182,7 @@ namespace Sonnet.GrayBox.Cosmos.Db.Connect
             }
             finally
             {
-                this.RequestTimeInSeconds += (DateTime.Now - start).TotalSeconds;
+                this.TotalRequestTime += totalElapsedTime;
             }
 
             return result;
@@ -195,22 +190,24 @@ namespace Sonnet.GrayBox.Cosmos.Db.Connect
 
         public async Task<List<T>> QueryItemAsync(string query)
         {
-            List<T> result = new List<T>();
-            DateTime start = DateTime.Now;
+            List <T> result = new();
+            double totalElapsedTime = 0;
 
             try
             {
                 CheckContainer();
 
-                QueryDefinition queryDefinition = new QueryDefinition(query);
+                QueryDefinition queryDefinition = new(query);
                 using FeedIterator<T> iterator = this._container.GetItemQueryIterator<T>(queryDefinition: queryDefinition);
                 while (iterator.HasMoreResults)
                 {
-                    FeedResponse<T> resultSet = await iterator.ReadNextAsync();
-                    //see the amount of RUs consumed on this request
-                    this.RequestCharge += resultSet.RequestCharge;
+                    FeedResponse<T> response = await iterator.ReadNextAsync();
 
-                    foreach (T item in resultSet)
+                    //see the amount of RUs consumed on this request
+                    TotalRequestCharge += response.RequestCharge;
+                    totalElapsedTime = response.Diagnostics.GetClientElapsedTime().TotalMilliseconds;
+
+                    foreach (T item in response)
                     {
                         result.Add(item);
                     }
@@ -218,7 +215,7 @@ namespace Sonnet.GrayBox.Cosmos.Db.Connect
             }
             catch (CosmosException e)
             {
-                _logger?.LogError($"Status Code: { e.StatusCode } | Message: { e.Message }");
+                _logger?.LogError($"Status Code: { e.StatusCode } | Exception: { e.Message }");
                 throw e;
             }
             catch (Exception e)
@@ -228,7 +225,7 @@ namespace Sonnet.GrayBox.Cosmos.Db.Connect
             }
             finally
             {
-                this.RequestTimeInSeconds += (DateTime.Now - start).TotalSeconds;
+                this.TotalRequestTime += totalElapsedTime;
             }
 
             return result;
@@ -236,25 +233,20 @@ namespace Sonnet.GrayBox.Cosmos.Db.Connect
 
         public async Task<T> UpdateItemAsync(T item, string id, PartitionKey partitionKey)
         {
-            ItemResponse<T> response;
-            DateTime start = DateTime.Now;
+            ItemResponse<T> response = null;
 
             try
             {
                 CheckContainer();
-
                 response = await this._container.ReplaceItemAsync<T>(item, id, partitionKey);
-                //see the amount of RUs consumed on this request
-                this.RequestCharge += response.RequestCharge;
             }
             catch (CosmosException e) when (e.StatusCode == HttpStatusCode.NotFound)
             {
-                _logger?.LogError($"Status Code: { e.StatusCode } | Message: { e.Message }");
-                response = null;
+                _logger?.LogError($"Status Code: { e.StatusCode } | Exception: { e.Message }");
             }
             catch (CosmosException e)
             {
-                _logger?.LogError($"Status Code: { e.StatusCode } | Message: { e.Message }");
+                _logger?.LogError($"Status Code: { e.StatusCode } | Exception: { e.Message }");
                 throw e;
             }
             catch (Exception e)
@@ -264,32 +256,28 @@ namespace Sonnet.GrayBox.Cosmos.Db.Connect
             }
             finally
             {
-                this.RequestTimeInSeconds += (DateTime.Now - start).TotalSeconds;
+                SetDiagnostics(response);
             }
+
             return response ?? Task.FromResult<T>(default).Result;
         }
 
         public async Task DeleteItemAsync(string id, string partitionKey)
         {
-            ItemResponse<T> response;
-            DateTime start = DateTime.Now;
+            ItemResponse<T> response = null;
 
             try
             {
                 CheckContainer();
-
                 response = await _container.DeleteItemAsync<T>(partitionKey: new PartitionKey(partitionKey), id: id);
-                //see the amount of RUs consumed on this request
-                this.RequestCharge += response.RequestCharge;
             }
             catch (CosmosException e) when (e.StatusCode == HttpStatusCode.NotFound)
             {
-                _logger?.LogError($"Status Code: { e.StatusCode } | Message: { e.Message }");
-                response = null;
+                _logger?.LogError($"Status Code: { e.StatusCode } | Exception: { e.Message }");
             }
             catch (CosmosException e)
             {
-                _logger?.LogError($"Status Code: { e.StatusCode } | Message: { e.Message }");
+                _logger?.LogError($"Status Code: { e.StatusCode } | Exception: { e.Message }");
                 throw e;
             }
             catch (Exception e)
@@ -299,19 +287,19 @@ namespace Sonnet.GrayBox.Cosmos.Db.Connect
             }
             finally
             {
-                this.RequestTimeInSeconds += (DateTime.Now - start).TotalSeconds;
+                SetDiagnostics(response);
             }
         }
 
-        private void CheckSettings(string databaseId = null, string containerId = null)
+        private void CheckSettings(string databaseId, string containerId)
         {
             if (string.IsNullOrEmpty(EndpointUri) 
                 || string.IsNullOrEmpty(PrimaryKey) 
                 || string.IsNullOrEmpty(Name) 
-                || string.IsNullOrEmpty(databaseId ?? DatabaseId) 
-                || string.IsNullOrEmpty(containerId ?? ContainerId))
+                || string.IsNullOrEmpty(databaseId) 
+                || string.IsNullOrEmpty(containerId))
             {
-                _logger.LogCritical(CosmosConnectException.DbInfoOmitted);
+                _logger?.LogCritical(CosmosConnectException.DbInfoOmitted);
                 throw new CosmosConnectException(CosmosConnectException.DbInfoOmitted);
             }
         }
@@ -320,8 +308,17 @@ namespace Sonnet.GrayBox.Cosmos.Db.Connect
         {
             if (_container == null)
             {
-                _logger.LogCritical(CosmosConnectException.UninitializedContainer);
+                _logger?.LogCritical(CosmosConnectException.UninitializedContainer);
                 throw new CosmosConnectException(CosmosConnectException.UninitializedContainer);
+            }
+        }
+
+        private void SetDiagnostics(ItemResponse<T> response)
+        {
+            if (response != null)
+            {   //see the amount of RUs consumed on this request
+                TotalRequestCharge += response.RequestCharge;
+                TotalRequestTime += response.Diagnostics.GetClientElapsedTime().TotalMilliseconds;
             }
         }
     }
